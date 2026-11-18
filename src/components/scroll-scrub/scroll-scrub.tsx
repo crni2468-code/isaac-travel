@@ -73,9 +73,44 @@ interface Segment {
 interface RuntimeSegment extends Segment {
   band: HTMLElement;
   layer: HTMLElement;
-  start: number
-…[1 chars truncated — re-run with head/grep/tail for full output]…
-ll)[]
+  start: number;
+  end: number;
+  current: number;
+  target: number;
+  visible: boolean;
+  loading: boolean;
+  ready: boolean;
+  failed: boolean;
+  loadedSource?: string;
+  video?: HTMLVideoElement;
+  objectUrl?: string;
+  abort?: AbortController;
+}
+
+interface Controller {
+  jumpToSection: (index: number) => void;
+}
+
+type ThemeStyle = CSSProperties & Record<`--ss-${string}`, string | number>;
+
+const clamp = (value: number, min = 0, max = 1) =>
+  Math.min(max, Math.max(min, value));
+
+const smoothstep = (value: number) => {
+  const x = clamp(value);
+  return x * x * (3 - 2 * x);
+};
+
+const lingerEase = (value: number, amount: number) => {
+  const x = clamp(value);
+  const linger = clamp(amount, 0, 0.6);
+  const centered = x - 0.5;
+  return (1 - linger) * x + linger * (4 * centered ** 3 + 0.5);
+};
+
+function buildSegments(
+  scenes: ScrollScrubScene[],
+  connectors: (ScrollScrubConnector | null)[]
 ): Segment[] {
   const result: Segment[] = [];
 
