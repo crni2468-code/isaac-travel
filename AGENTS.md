@@ -1,93 +1,73 @@
-# Scroll-scrub website
+# Custom UI recipes
 
-A **`type: "website"`** template — a standalone brand, NOT a Higgsfield app.
-The visitor's scroll plays a generated film while semantic chapters read over
-it. The scrub engine is already built; your job is the film, the scenes, and
-the brand.
+`@/components/custom-ui` is the required composition layer for this template.
+Extend these recipes backward-compatibly instead of creating route-local visual
+systems. Only `CustomAppShell` + `WorkspaceContent` are universal; page recipes
+are optional when the center is a custom canvas or generations feed.
 
-The authoritative workflow is the `website-builder-flow` skill
-(`references/scroll-scrub.md`). This file is the in-repo contract.
+| Recipe | Purpose |
+| --- | --- |
+| `CustomAppShell` | Responsive desktop sidebar + compact mobile navigation |
+| `SettingsRail` | Preset-style scrollable input/settings rail for either shell side |
+| `WorkspaceContent` | Central window mode: scrolling `page`, fixed `canvas`, or canonical `generations` feed |
+| `Page` | Width, responsive padding, and vertical page rhythm |
+| `PageHeader` | Eyebrow/title/description/action hierarchy |
+| `Section` | Section heading, helper copy, and optional trailing action |
+| `Panel` | Canonical bordered raised surface |
+| `VolumetricIconTile` | Canonical raised `sm/md/lg` icon box based on Figma Left_lg |
+| `MetricCard` | Exactly two text levels: one large value + one short label; optional third fact becomes a compact top-right badge |
+| `EmptyState` | Canonical zero-data state with one optional action |
 
-## The engine is done — do not rewrite it
+## Rules for additions
 
-`src/components/scroll-scrub/scroll-scrub.tsx` + `.css` ship the full runtime:
-Blob-backed seeking, seek coalescing, lazy nearby-segment loading, desktop and
-mobile sources, exact-frame posters held until a real painted frame, iOS
-gesture priming, `prefers-reduced-motion`, reverse scroll, and complete
-teardown (aborts, listeners, RAF, revoked Blob URLs).
+- First compose Quanta primitives inside an existing recipe.
+- Add a new shared recipe only after the pattern appears at least twice.
+- Keep state and business logic in features/routes; recipes own presentation.
+- Every interactive control needs keyboard behavior, focus visibility, labels,
+  disabled state, and error/busy feedback where relevant.
+- Keep every panel/card/toolbar/settings group to 3–4 primary children. Use
+  progressive disclosure or split the group when more functionality exists.
+- Do not create generic `Card`, `Container`, or `Box` wrappers that duplicate
+  `Panel`, `Page`, or `Section`.
+- Every neutral raised icon box uses `VolumetricIconTile`. Never recreate its
+  single-surface border, gradient, radius, or shadow inline.
+- Metric cards never stack three text rows. Keep only value + label; represent
+  a brief delta/status with `badge`, or move longer context outside the card.
+- Sidebar navigation always uses the shared `IconTile` with a Phosphor glyph;
+  gradient tiles render `weight="fill"` and must never receive Lucide outlines.
+- Every shell view wraps its center in `WorkspaceContent`. `generations` mode
+  renders canonical `UserGenerations` with the shared Studio `PromptBox` dock;
+  cards keep their built-in click-to-open `GenerationDetailModal`. Never
+  hand-build a feed grid or import private `@/components/gallery` internals.
+  Live feeds pass real `items`, `hasMore`, `loadingMore`, and a stable
+  `onLoadMore`; seeded history requires explicit `demo`. Never auto-page a
+  client-filtered subset of a global cursor.
+- Do not copy components from the other templates unless the product genuinely
+  needs that complete interaction contract.
 
-Do NOT rebuild the controller, drive per-frame values through React state, or
-attach a second scroll timeline to the same video elements. Adapt composition
-and scene data instead. The engine intentionally ships **no** header, no shared
-button system, no scroll hint, and no per-scene eyebrow — compose the site's
-own nav and bespoke CTAs around it.
+## shadcn UI kit (`@/components/ui`)
 
-## What you fill in
+`src/components/ui` is a complete shadcn v4 kit skinned with Quanta's
+`--hf-*` tokens and pixel-matched to the Higgsfield Components Figma
+(button, marketing-button, close-button, checkbox, switch, tabs/segmented
+control, badge, toast, dialog, text field/area). It coexists with Quanta;
+both resolve to the same tokens, so mixing them in one screen is safe.
 
-| File | What you do |
-|---|---|
-| `src/scroll-scrub-scenes.ts` | Brand tokens + the scene array. Every `<...>` placeholder gets real copy. |
-| `src/routes/index.tsx` | Compose the page: nav, chapters, CTAs, and the content sections after the journey. |
-| `public/assets/world/` | The encoded clips and their exact-frame posters. |
-| `src/styles.css` | The site's own token layer from the design brief. |
-| `src/app-meta.json` | `og_title`, `og_description`, `favicon_url`, `og_image_url`, `marketplace_cover_url`. |
+Division of labor:
 
-## Hard rules
-
-- **This is a website, not an app.** Never import `@higgsfield/quanta/*`, never
-  use q-prefixed tokens, never add "Sign in with Higgsfield", the fnf SDK, or
-  any runtime generation. No "Powered by Higgsfield" anywhere in page content.
-  The user's brand is the only brand on the page.
-- **Every `poster` is the exact first frame of the clip beside it.** Never a
-  design board, never an imagined destination still, never the next scene's
-  image. Generate posters from the ENCODED clip, after encoding.
-- **Provide `mobilePoster` whenever `mobileClip` is set.**
-- **Keep `scrollScrubScenes` a module constant.** Changing its identity on
-  every render rebuilds the controller.
-- **CSP:** the controller assigns Blob URLs to `<video src>`, so `media-src`
-  must include `blob:` and clip fetches stay same-origin (`connect-src 'self'`).
-- **Byte budget:** start at ≤32 MiB for all desktop clips and ≤16 MiB for all
-  mobile clips. Visited clips are retained for smooth reverse scroll, so
-  oversized clips cost memory as well as transfer.
-- **SSR safety:** no browser global at module top level or during render. A
-  top-level `window` reference crashes SSR.
-- **No placeholders may ship.** Every `<...>` token is replaced before deploy.
-
-## Vendored packages and legacy scaffold files
-
-`app/packages/` holds managed snapshots vendored from the Higgsfield web app
-(`@higgsfield/fnf`, `fnf-react`, `quanta`, `app-landing`). Websites never use
-them, but do NOT edit or delete them, and leave the Quanta Tailwind entry wired
-in `src/styles.css` — the build depends on it.
-
-**This template is a byte-for-byte copy of the `custom` app scaffold**, plus the
-three scroll-scrub files and a `/` that renders the journey. Keeping it in
-lockstep with `custom` is deliberate: the platform's build, deploy and design
-inspector all assume that tree, and every past divergence has been a bug.
-
-So it also carries the whole Higgsfield **app** surface — `src/layouts/`, the
-`/app` route, `src/landing-content.ts`, the fnf/Quanta components (composer,
-generation-card, gallery, asset-library, user-generations), the shadcn kit, and
-demo assets under `public/presets/`. For a website these are inert raw material,
-NOT part of the product:
-
-- Do NOT wire them into the site, and do NOT import from `@higgsfield/quanta/*`
-  or the fnf SDK by way of them.
-- Delete NOTHING. Unused files simply stay unreferenced. Removing them is what
-  makes this template drift from `custom`.
-- The shadcn primitives in `@/components/ui` may be restyled to the design brief
-  as ordinary React components when genuinely useful.
-
-## Required completion checks
-
-```bash
-cd app
-bun run typecheck
-bun run build   # runs check:ui first, same as every app template
-```
-
-`check:ui` scans `src/layouts`, `src/routes`, `src/components/custom-ui`,
-`src/features` and `src/widgets` for raw colour literals and `dark:` variants.
-It does NOT scan `src/components/scroll-scrub` or `src/scroll-scrub-scenes.ts`,
-so the site's own palette lives in those (and in `src/styles.css`) without
-tripping the gate. Keep raw hex out of route files.
+- Shell and canonical surfaces stay on the recipes above (`CustomAppShell`,
+  `WorkspaceContent`, `Panel`, `MetricCard`, …) and Quanta primitives.
+- Reach for `@/components/ui` for interaction primitives the recipes do not
+  cover: dialog/sheet/drawer, dropdown/context/menubar, command palette,
+  combobox, calendar, charts, OTP input, resizable panes, sidebar, toasts.
+- Toasts: mount `<Toaster />` from `@/components/ui/sonner` once at the root,
+  then `import { toast } from "sonner"`.
+- Buttons: `Button` is the app button; `MarketingButton` /
+  `MarketingButtonSpecial` are the glossy landing CTAs. Both take `loading`.
+- `check:ui` rules still apply to app code that composes the kit: no raw
+  colors, no arbitrary color classes, no `dark:`. Kit internals are exempt;
+  do not restyle kit components inline — pass semantic classes or extend the
+  kit itself.
+- Add more components with `bunx shadcn add <name>` (`components.json` is
+  configured); new ones inherit the theme through the shadcn alias variables
+  in `src/styles.css`.
