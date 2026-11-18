@@ -101,7 +101,7 @@ function buildHead(meta: AppMeta) {
     ],
     links: [
       { rel: "stylesheet", href: appCss },
-      { rel: "canonical", href: "https://isaac-travel.higgsfield.app/" },
+      { rel: "canonical", href: "https://isaac-travel-production.up.railway.app/" },
       ...(favicon ? [{ rel: "icon", href: favicon }] : []),
     ],
   };
