@@ -1,781 +1,459 @@
-# Instructions for AI agents using `@higgsfield/fnf`
+# Instructions for AI agents using `@higgsfield/quanta`
 
-Canonical AI guide for code that consumes or extends the fnf SDK; This file is
-the package-level source of truth for agents; `packages/fnf/CLAUDE.md` points
-here. The README explains the full SDK shape, while this guide is the strict
-operational contract: what to import, what to avoid, how to wire jobs/media/
-profile/observability, and how to keep model parity correct.
-
-For SDK implementation details, read `README.md`, source JSDoc, and tests. The
-tests are the executable spec.
+Canonical AI guide for generating code that consumes Quanta. Quanta is the
+Higgsfield design system package: theme runtime, Tailwind token utilities, and
+React components skinned with those tokens. Package/tool pointers should route
+here first.
 
 ## TL;DR rules
 
-
-1. **Use public subpath imports only**: `@higgsfield/fnf/client`, `/jobs`,
-   `/media`, `/profile`, `/characters`, `/references`,
-   `/observability`, `/workflow-platform`, `/errors`.
-   Never deep-import `src/` paths. `@higgsfield/fnf` ships the backend
-   ports/interfaces plus exactly ONE bundled adapter — the Workflow Platform
-   adapter at `@higgsfield/fnf/workflow-platform` (so fnf-only hosts are
-   self-sufficient for generated apps). Every other concrete adapter (fnf-web,
-   dev, apps-marketplace, memory) lives in the separate
-   `@higgsfield/fnf-adapters` package.
-2. **Never hand-build backend wire params or routes.** `createJobClient`,
-   `createMediaClient`, and `createProfileClient` own validation, codecs,
-   snake_case mapping, derived fields, route quirks, polling, and typed errors.
-3. **All normal SDK configuration is constructor input.** Do not add hidden
-   `process.env` reads, hardcoded tokens, user ids, or base URLs in job/media/
-   profile code. The one intentional exception is the server-only
-   `createAppsMarketplaceAdapter` secret fallback (`FNF_APPS_MARKETPLACE_SECRET`
-   by default), because that adapter is a trusted-service integration.
-4. **Settings are public camelCase.** Jobs map backend names with `z.wire`, for
-   example `batchSize -> batch_size`, `aspectRatio -> aspect_ratio`. Unknown
-   settings are stripped by schema parsing; deliberate raw wire fields belong
-   in `extra`.
-5. **`count` and `batchSize` are different.** `count` is SDK fan-out into N
-   separate submit calls. `batchSize` is a model setting sent inside one job.
-   Total outputs are `count * batchSize`. Because host confirmation tokens are
-   single-use, adapters with a `confirm` gate reject `count > 1`; use a model's
-   `batchSize` setting for multiple outputs from one confirmed request.
-6. **Upload media before submit.** `media.upload(...)` returns a `MediaRef`;
-   pass it to `client.submit({ media: { role: ref } })`. Seedance media uploads
-   that need IP checks must set `forceIpCheck: true`.
-7. **Job submission requires a host confirmation gate.** Every generation
-   adapter factory accepts a `confirm` option (`ConfirmSubmit`); if the host
-   submits generations on behalf of a user, you must implement it. Embedded
-   apps delegate the exact `jobSetType` + wire `params` to the platform's
-   injected approval API and must not add a second dialog. Standalone UI hosts
-   own their approval modal. `submit` calls the gate once per submission after
-   validation, before any network call. Resolve to proceed — a resolved string
-   token rides the submit body as `confirmation_token` — reject/throw to abort
-   with the typed
-   `confirmation_rejected` error. Only tests and non-interactive service flows
-   may omit it. See "Submission confirmation gate" below.
-8. **Attach or resolve `MediaRef.meta` when local validation depends on size or
-   duration.** Unknown meta is skipped locally and remains backend-authoritative.
-   `aspectRatio: 'auto'` uses first-image meta where model logic supports it.
-9. **Display credits are divided by 100.** Wallet fields from `getWallet()` are
-   backend credit-cents. `profile.getCredits()`, `profile.getSnapshot().credits`,
-   and `client.cost(input).credits` are display credits.
-10. **Use safe APIs across iframe/worker boundaries.** Prefer `safeSubmit` and
-    `safeUploadMedia`; branch on `error.code`. `instanceof` is not reliable after
-    JSON/postMessage/Comlink serialization.
-11. **Observability is metadata-only.** Observers may receive model ids, status,
-    durations, counts, and safe backend ids. Never emit prompts, auth headers,
-    tokens, request/response bodies, upload URLs, result URLs, filenames, emails,
-    workspace names, or file bytes. The submit confirmation token is a token —
-    it never goes into observer attributes.
-
-## Public entry points
-
-```ts
-import { createJobClient } from '@higgsfield/fnf/client'
-import { createCharacterClient } from '@higgsfield/fnf/characters'
-import { nanoBanana2, seedance2_0 } from '@higgsfield/fnf/jobs'
-import { createMediaClient } from '@higgsfield/fnf/media'
-import { createProfileClient } from '@higgsfield/fnf/profile'
-import { createReferenceClient } from '@higgsfield/fnf/references'
-import { createConsoleObserver } from '@higgsfield/fnf/observability'
-import { createWorkflowPlatformAdapter } from '@higgsfield/fnf/workflow-platform'
-import { createAppsMarketplaceAdapter, createDevFnfWebAdapter, createFnfWebAdapter } from '@higgsfield/fnf-adapters'
-import { errorFromJSON } from '@higgsfield/fnf/errors'
-```
-
-The root barrel also exports these APIs, but subpaths are preferred because
-agents and app bundlers can pull only the domain they need.
-
-## Adapters and auth
-
-One full adapter can satisfy jobs, media, and profile plus the optional
-Elements and character-training ports. Reuse the same adapter when a host wants
-a single auth/workspace context.
-
-Scope rule: the `https://fnf.internal` requirement is a Supercomputer generated
-app/template policy, not a universal SDK limitation. If the task explicitly
-targets another approved web app, product surface, dev sandbox, service
-integration, or custom endpoint, choose or implement the adapter for that host's
-backend contract. Do not force generated-app rules onto non-generated SDK
-consumers.
-
-| Adapter | Auth | Use |
-|---|---|---|
-| `createFnfWebAdapter({ baseUrl, getToken, workspaceId? })` | Clerk Bearer token plus optional `hf-workspace-id` | product/in-app flows |
-| `createDevFnfWebAdapter({ userId, workspaceId? })` | `hf-dev-user-id` plus optional `hf-workspace-id`; base URL defaults to dev | dev backend smoke tests and local sandboxes only |
-| `createAppsMarketplaceAdapter({ userId, workspaceId? })` | `fnf-apps-marketplace-secret` from `secret` or `FNF_APPS_MARKETPLACE_SECRET` + `hf-user-id`; base URL defaults to `https://dev-fnf.higgsfield.ai/apps-marketplace` | trusted server-side apps-marketplace proxy/sdk smoke tests; dev-only backend mount for now |
-| `createWorkflowPlatformAdapter({ baseUrl, observability? })` — BUNDLED in `@higgsfield/fnf/workflow-platform` | platform-attached server identity; no bearer token | generated apps and Supercomputer flows through `https://fnf.internal` |
-| `createMemoryBackend()` / `createMemoryMediaAdapter()` / `createMemoryProfileAdapter()` | none | tests, examples, offline demos |
-
-Every generation adapter factory above also accepts a `confirm` option — the
-host's submission confirmation gate (see "Submission confirmation gate" under
-Job recipes). Hosts that submit generations for a user must pass it.
-
-```ts
-import { createJobClient } from '@higgsfield/fnf/client'
-import { createMediaClient } from '@higgsfield/fnf/media'
-import { createProfileClient } from '@higgsfield/fnf/profile'
-import { createWorkflowPlatformAdapter } from '@higgsfield/fnf/workflow-platform'
-import { seedance2_0 } from '@higgsfield/fnf/jobs'
-
-const adapter = createWorkflowPlatformAdapter({
-  baseUrl: 'https://fnf.internal',
-})
-
-const jobs = createJobClient({ adapter, jobs: [seedance2_0] })
-const media = createMediaClient({ mediaAdapter: adapter })
-const profile = createProfileClient({ profileAdapter: adapter })
-```
-
-Generated apps must put this fnf.internal adapter server-side behind app-local
-server functions or `/api/*` routes. Other hosts may use their matching adapter
-or a custom backend-port implementation. Do not expose dev user ids, bearer
-tokens, or workspace secrets to arbitrary visitors.
-
-Apps Marketplace uses a different trusted-service header contract from the
-normal dev adapter. The backend mount is intentionally dev-only for now, and
-the service secret must never be shipped to browser code. This adapter is for
-SDK smoke tests and trusted service experiments, not generated apps:
-
-```ts
-import { createAppsMarketplaceAdapter } from '@higgsfield/fnf-adapters'
-
-const adapter = createAppsMarketplaceAdapter({
-  userId: actingUserId,
-  workspaceId,
-})
-```
-
-By default, the adapter reads `FNF_APPS_MARKETPLACE_SECRET` from the server
-environment. Pass `secret` for tests/custom secret loading, or `secretEnv` when
-the host uses a different env var name.
-
-The adapter returns the same `FnfAdapter` shape as `createFnfWebAdapter`, so pass
-it to `createJobClient`, `createMediaClient`, and `createProfileClient` exactly
-the same way. Do not duplicate route/body logic for `/apps-marketplace`; it
-mirrors the existing fnf routers behind different auth headers.
-
-For generated apps, use the Workflow Platform adapter against
-`https://fnf.internal`. It sends static, versionable routes under `/user`,
-`/workspaces/*`, `/reference-elements/*`, `/custom-references/*`, and
-`/jobs/*`; the platform behind fnf.internal resolves the final internal
-endpoints and body quirks. The SDK still handles model
-validation, camelCase settings, `z.wire` serialization, media refs, profile
-mapping, costs, polling, and typed errors.
-
-```ts
-import { createWorkflowPlatformAdapter } from '@higgsfield/fnf/workflow-platform'
-
-const adapter = createWorkflowPlatformAdapter({
-  baseUrl: 'https://fnf.internal',
-  observability,
-})
-```
-
-In generated apps, do not use env-controlled backend URL selectors, public fnf
-URLs, dev fnf URLs, apps marketplace URLs, `getToken`, `Authorization`,
-`hf-dev-user-id`, or service secrets. The platform attaches identity
-automatically to server-side `https://fnf.internal` egress. In non-generated
-hosts, follow that host's explicit adapter/auth contract instead.
-
-fnf.internal method contract:
-
-- Submit goes through `POST /jobs/submit`.
-- Cost goes through `POST /jobs/cost`.
-- Cancel goes through `POST /jobs/{job_id}/cancel`.
-- Media presign goes through `POST /jobs/media/presign`.
-- Media confirm goes through `POST /jobs/media/{media_id}/confirm`.
-- Job reads go through `GET /jobs/{job_id}`, `GET /jobs/sets/{job_set_id}`,
-  and the feed route `GET /jobs?gen_type=<image|video|...>`.
-- Media reads go through `GET /jobs/media/{media_id}` and `GET /jobs/media`.
-- Element reads go through `GET /reference-elements/{element_id}` and
-  `GET /reference-elements`.
-- Character training goes through `POST /custom-references`; lifecycle reads
-  go through `GET /custom-references/{character_id}`.
-- User/profile reads go through `GET /user`.
-- Workspace reads go through `GET /workspaces`, `GET /workspaces/current`,
-  and `GET /workspaces/wallet`.
-- Workspace switch goes through `POST /workspaces/switch`.
-
-Do not hand-write `fetch('/jobs')` with an `operation` body,
-`fetch('/jobs?operation=submit')`, or model-specific fnf routes in generated
-apps. Use `createJobClient`, `createMediaClient`, and `createProfileClient`
-with `createWorkflowPlatformAdapter`. If an app wraps SDK calls in TanStack
-server functions or `/api/*` routes, submit/cost/media routes must be `POST`,
-not `GET`. A 405 / "Method Not Allowed" on generation is usually this method or
-stale SDK snapshot mismatch.
-
-## Elements and custom-reference character recipes
-
-Elements are the user's reusable asset library; Characters are one Element
-kind. Character training is a separate multi-image operation that creates a
-processing Character Element. Do not wrap Elements in a character-only
-abstraction and do not add presets to this flow.
-
-```ts
-import { createCharacterClient } from '@higgsfield/fnf/characters'
-import { createJobClient } from '@higgsfield/fnf/client'
-import { soulV2Image } from '@higgsfield/fnf/jobs'
-import { createReferenceClient } from '@higgsfield/fnf/references'
-
-const references = createReferenceClient({ adapter })
-const characters = createCharacterClient({ adapter })
-const jobs = createJobClient({ adapter, jobs: [soulV2Image] })
-
-const existing = await references.list({ category: 'character', size: 50 })
-
-const pending = await characters.create({
-  name: 'My character',
-  type: 'soul_2',
-  images, // 1–100 MediaRef values; upload browser Files first
-})
-const character = await characters.wait(pending)
-
-if (character.status === 'completed') {
-  await jobs.submit({
-    model: 'text2image_soul_v2',
-    prompt: { instruction: 'Candid flash photo at a late-night diner' },
-    settings: { customReferenceId: character.id, batchSize: 4 },
-  })
-}
-```
-
-Rules:
-
-- Supported types are `soul`, `soul_2` (default), and
-  `soul_cinematic`; use the generic custom-reference route for all of them.
-- `soul` accepts uploaded `media_input` refs only. `soul_2` and
-  `soul_cinematic` also accept compatible image job refs ending in `_job`.
-- Poll to `completed` or `failed`, then refresh the Elements query.
-- Existing Character Elements expose `reference.characterId`; generation
-  uses that value as `settings.customReferenceId`. Element id and character
-  id are different.
-- Use `references.list/get` and `characters.create/get/wait`; never
-  hand-write the underlying routes.
-
-### LLM (chat completions) — same zero-token rail
-
-Generated apps reach the platform LLM through the SAME zero-token egress rail
-as `fnf.internal` jobs — construct the client with the `/llm` mount and NO
-`getToken`/`userId`; the platform attaches the signed-in visitor's identity on
-egress, and spend is billed to that visitor's credits:
-
-```ts
-import { createLlmClient } from '@higgsfield/fnf'
-
-// Worker-side only (server functions / `/api/*` routes) — never browser code.
-const llm = createLlmClient({ baseUrl: 'https://fnf.internal/llm' })
-
-const [model] = await llm.listModels()
-if (!model) throw new Error('No LLM models are currently available')
-
-const res = await llm.complete({
-  model,
-  messages: [{ role: 'user', content: 'One-line haiku about renders.' }],
-})
-
-for await (const chunk of llm.stream({
-  model,
-  messages: [{ role: 'user', content: 'Stream me a haiku.' }],
-})) {
-  // chunk.choices[0].delta.content — SSE deltas, OpenAI-compatible shape
-}
-```
-
-Rules: do NOT pass `getToken`, `userId`, or any secret on this rail (the README's
-external `fnf-api-gw` + `getToken` example is for NON-generated first-party hosts
-only); Worker-side only. Model availability is runtime gateway configuration:
-call `listModels()` server-side, use exact returned ids, handle an empty list,
-and never hardcode a catalog. A React model picker may receive those ids through
-an authenticated app-local server function or route. Pass only a browser-safe
-proxy backend to `FnfProvider` as `llm`; never pass the raw internal client to
-client-rendered code (see `@higgsfield/fnf-react`'s `ai/AGENTS.md`).
-
-Apps Marketplace uses a different trusted-service header contract from the
-normal dev adapter. The backend mount is intentionally dev-only for now, and
-the service secret must never be shipped to browser code. This adapter is for
-SDK smoke tests and trusted service experiments, not generated apps:
-
-```ts
-import { createAppsMarketplaceAdapter } from '@higgsfield/fnf-adapters'
-
-const adapter = createAppsMarketplaceAdapter({
-  userId: actingUserId,
-  workspaceId,
-})
-```
-
-By default, the adapter reads `FNF_APPS_MARKETPLACE_SECRET` from the server
-environment. Pass `secret` for tests/custom secret loading, or `secretEnv` when
-the host uses a different env var name.
-
-The adapter returns the same `FnfAdapter` shape as `createFnfWebAdapter`, so pass
-it to `createJobClient`, `createMediaClient`, and `createProfileClient` exactly
-the same way. Do not duplicate route/body logic for `/apps-marketplace`; it
-mirrors the existing fnf routers behind different auth headers.
-
-For generated apps, use the Workflow Platform adapter against
-`https://fnf.internal`. It sends static, versionable routes under `/user`,
-`/workspaces/*`, and `/jobs/*`; the platform behind fnf.internal resolves the
-final internal endpoints and body quirks. The SDK still handles model
-validation, camelCase settings, `z.wire` serialization, media refs, profile
-mapping, costs, polling, and typed errors.
-
-```ts
-import { createWorkflowPlatformAdapter } from '@higgsfield/fnf/workflow-platform'
-
-const adapter = createWorkflowPlatformAdapter({
-  baseUrl: 'https://fnf.internal',
-  observability,
-})
-```
-
-In generated apps, do not use env-controlled backend URL selectors, public fnf
-URLs, dev fnf URLs, apps marketplace URLs, `getToken`, `Authorization`,
-`hf-dev-user-id`, or service secrets. The platform attaches identity
-automatically to server-side `https://fnf.internal` egress. In non-generated
-hosts, follow that host's explicit adapter/auth contract instead.
-
-fnf.internal method contract:
-
-- Submit goes through `POST /jobs/submit`.
-- Cost goes through `POST /jobs/cost`.
-- Cancel goes through `POST /jobs/{job_id}/cancel`.
-- Media presign goes through `POST /jobs/media/presign`.
-- Media confirm goes through `POST /jobs/media/{media_id}/confirm`.
-- Job reads go through `GET /jobs/{job_id}`, `GET /jobs/sets/{job_set_id}`,
-  and the feed route `GET /jobs?gen_type=<image|video|...>`.
-- Media reads go through `GET /jobs/media/{media_id}` and `GET /jobs/media`.
-- User/profile reads go through `GET /user`.
-- Workspace reads go through `GET /workspaces`, `GET /workspaces/current`,
-  and `GET /workspaces/wallet`.
-- Workspace switch goes through `POST /workspaces/switch`.
-
-Do not hand-write `fetch('/jobs')` with an `operation` body,
-`fetch('/jobs?operation=submit')`, or model-specific fnf routes in generated
-apps. Use `createJobClient`, `createMediaClient`, and `createProfileClient`
-with `createWorkflowPlatformAdapter`. If an app wraps SDK calls in TanStack
-server functions or `/api/*` routes, submit/cost/media routes must be `POST`,
-not `GET`. A 405 / "Method Not Allowed" on generation is usually this method or
-stale SDK snapshot mismatch.
-
-## Job recipes
-
-Register only the jobs the host can actually use. The `jobs: [...]` registry is
-what gives `model`, `settings`, and media roles their TypeScript narrowing.
-
-```ts
-import { createJobClient } from '@higgsfield/fnf/client'
-import { seedance2_0 } from '@higgsfield/fnf/jobs'
-
-const client = createJobClient({ adapter, jobs: [seedance2_0] })
-
-const { generations } = await client.submit({
-  model: 'seedance_2_0',
-  prompt: { instruction: 'cinematic lightning over the ocean' },
-  settings: {
-    mode: 'std',
-    duration: 5,
-    aspectRatio: '16:9',
-    resolution: '720p',
-    batchSize: 1,
-  },
-})
-
-const [done] = await client.wait(generations, {
-  signal,
-  onProgress: generation => {
-    console.log(generation.status)
-  },
-})
-
-console.log(done.results?.rawUrl)
-```
-
-Useful client calls:
-
-- `submit(input)` submits immediately and returns generations.
-- `safeSubmit(input)` returns `{ ok: true, ... } | { ok: false, error }`.
-- `adjust(input, ['near-aspect-ratio', 'near-duration'])` explicitly snaps
-  values; `submit` itself does not normalize.
-- `cost(input)` returns display credits for UI previews.
-- `get(id)`, `getSet(jobSetId)`, `poll(id)`, and `wait(generations)` read and
-  poll generation state.
-- `cancel(id)` cancels queued jobs when the adapter supports it.
-- `list(opts)` reads the generation feed; handle typed `not_supported` for
-  filters the backend route cannot support.
-
-When regenerating, submit the parsed read-model input back through the same
-client and registry:
-
-```ts
-await client.submit(done.input as Parameters<typeof client.submit>[0])
-```
-
-### Submission confirmation gate
-
-If the host submits generations on behalf of a user, implement the `confirm`
-gate — pass it to the adapter factory (all generation adapters accept it).
-Embedded apps must call the platform's injected approval API with the exact
-`jobSetType` and final wire `params`, return its token unchanged, and must not
-open an additional browser or custom dialog. Standalone UI hosts own their
-approval modal. `submit` calls the gate after validation and wire-param
-building, before any network call. Because confirmation tokens are single-use,
-`submit` rejects `count > 1` before invoking the gate; use the model's
-`batchSize` setting when it supports multiple outputs in one request.
-
-Contract (`ConfirmSubmit` from `@higgsfield/fnf`):
-
-- Resolve to proceed. Resolving with a string sends it as top-level
-  `confirmation_token` on the create request (e.g. a token minted by the
-  host's own confirm endpoint or modal flow).
-- Resolve with nothing only when the standalone host's approval flow is tokenless.
-- Reject/throw to abort: `submit` fails with the typed
-  `confirmation_rejected` error and no request is sent. Branch on
-  `error.code === 'confirmation_rejected'` — user declined is not a failure.
-
-```ts
-const adapter = createFnfWebAdapter({
-  baseUrl,
-  getToken,
-  // An embedded host owns the security UI and mints the intent token.
-  confirm: ({ jobSetType, params }) =>
-    platformApproval.requestGeneration(jobSetType, params),
-})
-```
-
-Do not auto-confirm (`confirm: async () => {}` in a real UI host defeats the
-gate), and never log or emit the token through observability.
-
-## Media recipes
-
-Media is a separate client. Upload and resolve APIs produce `MediaRef` objects
-that job media codecs know how to serialize.
-
-Strict upload rule for generated apps and server bridges: binary files do not go
-through JSON. Never pass browser `File`, `Blob`, `ArrayBuffer`, `Uint8Array`,
-base64 strings, or byte arrays through `createServerFn` input or a JSON request
-body. Use multipart `FormData` to an app-local `POST /api/media/upload` route,
-read `await file.arrayBuffer()` server-side, call `media.upload({ source:
-bytes, ... })`, and return only the submit-ready `MediaRef`. The later
-generation request should contain prompt/settings/`MediaRef` only.
-
-Bad patterns:
-
-```ts
-await generate({ data: { file } })                 // bad: File through JSON
-await generate({ data: { bytes: Array.from(u8) } }) // bad: huge JSON
-String.fromCharCode(...u8)                         // bad: stack overflow
-```
-
-Good shape:
+1. **Import the CSS exactly once at the app root** (root CSS or root client
+   entry):
+   ```ts
+   import '@higgsfield/quanta/theme.css'
+   import '@higgsfield/quanta/primitives.css'
+   import '@higgsfield/quanta/tailwind.css'
+   ```
+2. **Use public subpath imports only.** Example:
+   `import { Button } from '@higgsfield/quanta/button'`. Never import from
+   `src/components/*`.
+3. **Use Quanta components before custom markup.** Button, Input, Modal,
+   Dropdown, Command, Vault, Tabs, form controls, status, feedback, and display
+   primitives are already available.
+4. **Prefix design-semantic utilities with `q-`.** Use
+   `bg-q-background-primary`, `text-q-body-md-regular`,
+   `border-q-border-subtle`, `z-q-modal`.
+5. **Spacing is native Tailwind scale, not old token numbers.** Use `p-4`,
+   `gap-2`, `h-10`, `md:grid`. Do not use stale classes like `p-400`,
+   `gap-200`, or `mt-300`.
+6. **Use composite typography.** Use `text-q-headline-md-semi-bold`, not
+   `text-2xl font-semibold`.
+7. **Do not invent utilities or hardcode colors/sizes.** Check
+   `src/css/tailwind/*.css` or ask for a token gap.
+8. **Generated apps should look finished, not merely functional.** Build real
+   layouts with clear hierarchy, breathing room, responsive constraints,
+   empty/loading/error states, and polished control choices.
+
+## The `q-` namespace
+
+Quanta shares a Tailwind build with legacy Higgsfield UI packages; to avoid
+collisions, design-semantic utilities are prefixed with `q-`. Rule of thumb:
+color, type, z-index, border-width, and component classes use `q-`; spacing,
+layout, sizing, and breakpoints use native Tailwind. Border widths:
+`border-q-hairline` (0.5px), `border-q-thin`, `border-q-medium`,
+`border-q-thick`.
+
+Do not expose Quanta internals as app API. `q-button-*`, `q-menu-*`,
+`q-modal-*`, and similar classes exist so Quanta components can render. App
+code should use components and recipe helpers such as `button()` only when
+styling a non-button trigger.
+
+## Utility quick reference
+
+### Color
 
 ```txt
-browser File -> POST multipart /api/media/upload -> media.upload -> MediaRef
-MediaRef + prompt/settings -> POST /api/generate -> jobs.submit
+Surface:  bg-q-background-{primary,secondary,secondary-strong,tertiary,inverse,glass,elevated-start,elevated-end}
+Text:     text-q-text-{primary,secondary,tertiary,inverse,disabled,link,brand,danger,success,warning,info,on-overlay-secondary,on-overlay-tertiary}
+Border:   border-q-border-{default,subtle,strong,focus,error,warning,success,inverse}
+State:    bg/text/border-q-state-{error,success,warning,info}-*
+Brand:    bg/text/border-q-brand-{primary,blue,cyan,green,orange,pink,red,yellow,yellow-light}
 ```
 
-```ts
-import { createMediaClient, createDomMediaMetaResolver, resolveMediaMeta } from '@higgsfield/fnf/media'
+Prefer semantic roles. Raw palette utilities are for Quanta internals only.
 
-const media = createMediaClient({ mediaAdapter: adapter })
+### Typography
 
-const { ref } = await media.upload({
-  source: fileBytes,
-  filename: 'frame.png',
-  type: 'image',
-  forceIpCheck: true,
-})
+Composite typography utilities include font size, line-height, font weight,
+letter spacing, and font family where needed.
 
-const input = {
-  model: 'seedance_2_0' as const,
-  media: { start_image: [ref] },
-  prompt: { instruction: 'animate this frame' },
-  settings: { duration: 5, aspectRatio: 'auto' as const },
-}
-
-const measured = await resolveMediaMeta(input, createDomMediaMetaResolver())
-await jobs.submit(measured)
+```txt
+Roles:    display, headline, title, body, label, caption, mono, accent
+Sizes:    lg, md, sm
+Weights:  black, bold, semi-bold, medium, regular
 ```
 
-Notes:
+Families per role: `display`/`headline`/`title` render Space Grotesk (the
+brand headline face), `body`/`label`/`caption` render Inter, `accent` is
+Space Grotesk bold (tight tracking; pair with `uppercase` for the hero/CTA
+look), `mono` is IBM Plex Mono.
 
-- `media.upload({ source })` accepts only `Blob`, `ArrayBuffer`, `Uint8Array`, or
-  a lazy `{ read() }` returning one of those. Invalid JSON-shaped sources fail
-  early with `invalid_media_source`.
-- `MediaRef.meta` never goes to the backend; it only powers local validation and
-  local aspect/size derivation.
-- `uploadFromUrl` is convenience, not SSRF protection. For server-side
-  untrusted URLs, inject a hardened uploader/fetcher with private-IP, redirect,
-  byte-size, and content-type policy.
-- Moderation/IP results are data. Use `safeUploadMedia` when crossing process
-  boundaries.
+### Z-index
 
-## Profile and workspace recipes
-
-The profile client is the SDK account/workspace domain. It is not the app's
-creator-profile entity.
-
-```ts
-import { createProfileClient } from '@higgsfield/fnf/profile'
-
-const profile = createProfileClient({ profileAdapter: adapter })
-
-const user = await profile.getUser()
-const workspaces = await profile.listWorkspaces()
-const currentWorkspace = await profile.getCurrentWorkspace()
-const wallet = await profile.getWallet()
-const credits = await profile.getCredits({ includeOnDemand: true })
-const snapshot = await profile.getSnapshot()
-
-await profile.switchWorkspace({ workspaceId: workspaces[0].id })
+```txt
+z-q-{base,dropdown,sticky,overlay,modal,popover,toast,tooltip}   ← 8 semantic keys (0..70 in steps of 10)
 ```
 
-Public fields are camelCase:
+Semantic names are the canonical choice over Tailwind's `z-N`.
 
-- user: `workspaceId`, `workspaceType`, `workspaceRole`, `planType`,
-  `billingPeriod`, `totalPlanCredits`
-- workspace: `clerkOrganizationId`, `avatarUrl`, `isOwner`
-- wallet: `subscriptionBalance`, `subscriptionTotal`, `creditsBalance`,
-  `onDemandCredits`
+### Spacing and breakpoints
 
-Credit display rule:
+Use native Tailwind spacing from the configured scale:
+`0`, `0.5`, `1`, `1.5`, `2`, `2.5`, `3`, `4`, `5`, `6`, `7`, `8`, `10`,
+`12`, `14`, `16`, `20`, `24`.
 
-```ts
-wallet?.subscriptionBalance          // raw backend credit-cents; not for UI
-credits?.totalAvailableCredits       // display credits; safe for UI
-credits?.raw.totalAvailableCredits   // raw value for debug/accounting only
+Examples: `p-6`, `px-4`, `gap-3`, `space-y-4`, `h-10`, `w-80`.
+
+Breakpoints are mobile-first. Quanta ships three named variants (see
+`src/css/tailwind/breakpoint.css`): `q-tablet:` (48rem), `q-desktop:` (80rem),
+`q-wide:` (120rem). Tailwind's default `sm:`/`md:`/`lg:`/`xl:`/`2xl:` variants
+also work. There are no `tablet:`/`desktop:`/`wide:` variants.
+
+## Component catalog
+
+Import every component by subpath, e.g.
+`import { Modal } from '@higgsfield/quanta/modal'`.
+
+### Actions and navigation
+
+| Component | Import | Use |
+|---|---|---|
+| `Button`, `button` | `@higgsfield/quanta/button` | Primary/secondary actions, links with `as="a"`, trigger composition with `asChild` |
+| `NavigationMenu` | `@higgsfield/quanta/navigation-menu` | Product nav, app top nav, grouped menus |
+| `Sidebar` | `@higgsfield/quanta/sidebar` | Product navigation rail — header switcher, sections, composite `Item` rows (`ItemIcon`/`ItemLabel`/`ItemMeta`/`ItemEnd`), built-in collapse (`Toggle`) |
+| `Tabs` | `@higgsfield/quanta/tabs` | View switching, segmented controls, modal header tabs |
+| `Dropdown` | `@higgsfield/quanta/dropdown` | Menus, model pickers, searchable selection, submenus |
+| `Command` | `@higgsfield/quanta/cmdk` | Command palette, quick switchers, keyboard-first search |
+| `ButtonGroup`, `buttonGroup` | `@higgsfield/quanta/button-group` | Segmented action clusters and icon toolbars — propagates `size`/`variant`, `attached` joins, `orientation` stacks |
+
+Button variants:
+
+- Product actions: `primary`, `secondary`, `tertiary`, `outline`, `ghost`, `brandSoft`
+  — variant colors do NOT follow the token names: `primary` = flat lime,
+  `secondary` = solid white, `tertiary` = dark white/10 glass. In this
+  template's apps, ordinary/navigation actions use the dark
+  `tertiary`/`ghost`; generation CTAs use `marketingPrimary`
+- Destructive: `danger`, `dangerSoft`
+- Marketing: `marketingPrimary`, `marketingSecondary`,
+  `marketingTertiary`, `marketingGhost`
+- Special accents: `specialBrand`, `specialPink`
+
+Use `iconOnly` only for true icon buttons with an accessible label.
+
+### Forms and controls
+
+| Component | Import | Use |
+|---|---|---|
+| `Input` | `@higgsfield/quanta/input` | Labelled single-line fields, helper/error text, prefix/suffix icons |
+| `Textarea` | `@higgsfield/quanta/textarea` | Labelled multi-line fields, prompts, comments, notes |
+| `Select` | `@higgsfield/quanta/select` | Single/multiple choice from a known option set — field-styled trigger, grouped glass popup, leading icons/badges; selected row highlights; `connected` on `Root` nests the field inside a wider popup that overlaps behind it (min-width floored) |
+| `Autocomplete` | `@higgsfield/quanta/autocomplete` | Type-to-filter selection — search input + filtered glass list, rich item rows, clear affix, empty state; `connected` on `Root` nests the input inside a wider popup that overlaps behind it (input stays on top + typable) |
+| `Checkbox`, `CheckboxLabel` | `@higgsfield/quanta/checkbox` | Multi-select booleans and labelled checkbox rows |
+| `RadioGroup`, `Radio`, `RadioLabel` | `@higgsfield/quanta/radio` | Exclusive choices |
+| `Switch` | `@higgsfield/quanta/switch` | Binary settings that apply immediately |
+| `Slider` | `@higgsfield/quanta/slider` | Stepped or continuous numeric settings |
+| `Toggle` | `@higgsfield/quanta/toggle` | Pressed/unpressed toolbar controls |
+| `Chip` | `@higgsfield/quanta/chip` | Compact selectable/filter-like chips |
+
+Use the dedicated control for the setting shape. Do not model binary settings
+as a `Button`; use `Switch`, `Checkbox`, or `Toggle`.
+
+### Overlays and feedback
+
+| Component | Import | Use |
+|---|---|---|
+| `Modal` | `@higgsfield/quanta/modal` | Centered dialogs, confirmation, editors, complex panels |
+| `Vault` | `@higgsfield/quanta/vault` | Edge-docked drawer/sheet, especially mobile or tool panels |
+| `Toaster`, `toast` | `@higgsfield/quanta/sonner` | App-root toast viewport and imperative notifications |
+| `Progress` | `@higgsfield/quanta/progress` | Bar, line, dots, determinate/indeterminate progress |
+| `Loader` | `@higgsfield/quanta/loader` | Indeterminate spinner — dots/circle/stars/shine, slot-tinted |
+| `Tooltip` | `@higgsfield/quanta/tooltip` | Hover/focus hint popup — small inverted surface, optional arrow, `Provider` shares delay |
+| `CloseButton`, `closeButton` | `@higgsfield/quanta/close-button` | Round dismiss for overlays; recipe styles a framework close part |
+
+Mount one `Toaster` near the app root before calling `toast.*`.
+
+### Display primitives
+
+| Component | Import | Use |
+|---|---|---|
+| `Avatar` | `@higgsfield/quanta/avatar` | User/workspace identity, presence |
+| `Badge`, `badge` | `@higgsfield/quanta/badge` | New/pro/status marker |
+| `Tag` | `@higgsfield/quanta/tag` | Removable categories or model metadata |
+| `Dot` | `@higgsfield/quanta/dot` | Presence/status point |
+| `Kbd`, `KbdSequence` | `@higgsfield/quanta/kbd` | Keyboard shortcuts |
+| `Divider` | `@higgsfield/quanta/divider` | Structural separators |
+| `NotFound` | `@higgsfield/quanta/not-found` | Empty/not-found states where available |
+| `Accordion` | `@higgsfield/quanta/accordion` | Expandable content sections — single/multiple open, `list`/`separated` surface, `sm`/`md`/`lg` size (scales padding, radius, type) |
+| `Icon`, `icon` | `@higgsfield/quanta/icon` | Render an icon glyph at a token `size`/`color` (`as={SomeIcon}`); `icon()` recipe styles a non-Icon element |
+| `Typography`, `typography` | `@higgsfield/quanta/typography` | Semantic text as a component — `variant` (display/headline/title/body/label/caption/mono/accent + size/weight) + `color`; the component form of the `text-q-*` utilities |
+
+### Layout and surfaces
+
+| Component | Import | Use |
+|---|---|---|
+| `Grid` | `@higgsfield/quanta/grid` | Responsive grids — fixed/`auto-fit`/`auto-fill` columns, `minColWidth`, `gap`, `Grid.Item` `colSpan`/`rowSpan`; `animate` FLIP-animates reflow/reorder/filter (per-cell `flipKey`) |
+| `VirtualGrid` | `@higgsfield/quanta/grid` | Windowed, data-driven grid for big feeds & galleries — `items`+`renderItem`, `overscan`, fixed `cols` or responsive `minColWidth`, uniform `rowHeight`. Pair with `Media.Video autoPlayInView`. Also exports `useInView`/`useGridVirtualizer` |
+| `Media` | `@higgsfield/quanta/media` | Fixed-ratio image/video tiles — `ratio`/`fit`/`rounded`, `Overlay`/`Caption`/`Fallback` parts, `useMediaFallback` onError flow; `Media.Video autoPlayInView` plays (muted) only while on screen |
+| `Glass`, `glass` | `@higgsfield/quanta/glass` | Real frosted-glass surface — backdrop blur+saturate, specular edge + top sheen; pin over colorful media |
+| `Card`, `card` | `@higgsfield/quanta/card` | Glass/solid content surface — `Header`/`Body`/`Footer` parts, `surface` glass\|solid, `elevation` flat\|raised; `card()` recipe |
+
+## Component API reference
+
+Per-component props. **These are the props you need — do NOT open the component
+`.tsx` source to re-derive them.** Only the component's OWN props are listed;
+every component also forwards native element / Base UI props (`className`,
+`ref`, `onClick`, `render`, controlled `value`/`open` state, etc.). Lowercase
+names (`button()`, `card()`) are class-string recipe helpers for styling a
+non-component element. `SlotColor` = `'brand' | 'neutral' | 'success' | 'error'
+| 'warning' | 'info'`.
+
+### Actions and navigation
+
+**`Button`** — `@higgsfield/quanta/button`
+`variant` (`'primary' | 'secondary' | 'tertiary' | 'outline' | 'ghost' | 'danger' | 'dangerSoft' | 'brandSoft' | 'marketingPrimary' | 'marketingSecondary' | 'marketingTertiary' | 'marketingGhost' | 'specialBrand' | 'specialPink'`; default `'primary'`); `size` (`'xxs' | 'xs' | 'sm' | 'md' | 'lg'`; default `'sm'`); `iconOnly` (bool; needs an accessible label); `start`/`end` (ReactNode slots); `as` (ElementType, e.g. `as="a"`); `asChild` (bool — merge onto single child); `children` (label). Real `<button>` gets implicit `type="button"`.
+
+**`ButtonGroup`** — `@higgsfield/quanta/button-group`
+`orientation` (`'horizontal' | 'vertical'`; default `'horizontal'`); `attached` (bool; default `true` — segmented vs spaced); `size`/`variant` (propagate to child Buttons; child's own wins).
+
+**`Tabs`** — `@higgsfield/quanta/tabs` · Parts: `Root`/`List`/`Tab`/`Panel`
+`Root`: `variant` (`'underline' | 'pill' | 'segmented' | 'soft'`; default `'underline'`), `shape` (`'rounded' | 'pill' | 'icon'`; default `'rounded'`), `surface` (`'glass' | 'flat'`; default `'glass'`), `tone` (`'default' | 'accent' | 'glass' | 'solid' | 'brandSoft' | 'brand'`), `color` (`SlotColor`; default `'brand'`), + `value`/`defaultValue`/`onValueChange`. `List`: `indicator` (bool; default `true`), `fullWidth` (bool), `items` (data-driven `TabItem[]`). `Tab`: `value`, `iconOnly`, `start`/`end`/`subtitle`.
+
+**`Dropdown`** — `@higgsfield/quanta/dropdown` · Parts: `Root`/`Trigger`/`Content`/`Group`/`Label`/`Separator`/`Item`/`Sub`/`SubTrigger`/`SubContent` (+ Item sub-parts)
+`Root`: `selectionMode` (`'single' | 'multiple'`; default `'multiple'`), `selected`/`defaultSelected` (`string[]`), `onSelected`, `openOnHover`, + `open`/`onOpenChange`. `Content`: `size` (`'compact' | 'default' | 'large'`; default `'default'`), `surface` (`'glass' | 'solid'`), `side`/`align`/`sideOffset`, `withSearch` (bool), `searchPlaceholder`, `notFound`. `Item`: `value`, `selectable`, `disabled`, `danger`, `checked`/`onCheckedChange`, `onSelect`, slots `start`/`media`/`title`/`subtitle`/`badge`/`end`, `indicator` (`'check' | 'checkbox' | 'switch'`).
+
+**`Command`** — `@higgsfield/quanta/cmdk` · Parts: `Root`/`Dialog`/`Input`/`List`/`Empty`/`Loading`/`Group`/`Item`/`Separator`/`Shortcut`/`Body`/`Detail`/`Footer`/`Action`
+`Root`: `value`/`defaultValue`/`onValueChange`, `shouldFilter` (default `true`), `filter`, `loading`, `loop` (default `true`), `label`. `Dialog`: + `open`/`defaultOpen`/`onOpenChange`, `shortcut` (e.g. `'mod+k'`), `size` (`ModalSize`; default `'md'`). `Input`: `start` (default search icon), `placeholder`. `Item`: `value`, `keywords`, `disabled`, `onSelect`, `detail`, `action`. `Group`: `heading`.
+
+**`NavigationMenu`** — `@higgsfield/quanta/navigation-menu` · Parts: `Root`/`List`/`Item`/`Trigger`/`Content`/`Link`/`Actions`/`Action`/`Menu`/`MenuItem`… (rich mega-menu set)
+`Root`: `side` (default `'bottom'`), `align` (default `'center'`), `sideOffset` (default `8`). `Trigger`/`Link`: `accent` (bool, lime), `active` (bool, sets `aria-current`). `Action`: `iconOnly`, `href`. `Menu`: `rows` (`1|2|3|4`; default `2`), `size` (`'auto'|'image'|'video'|'audio'|'plugins'`), `layout` (`'grid'|'columns'|'custom'`), `featured`.
+
+**`Sidebar`** — `@higgsfield/quanta/sidebar` · Parts: `Root`/`Header`/`Switcher`/`Toggle`/`Body`/`Search`/`Section`/`SectionHeader`/`SectionItems`/`Item`/`ItemIcon`/`ItemLabel`/`ItemMeta`/`ItemEnd`/`Footer`/`FooterItem`…
+`Root`: `collapsed`/`defaultCollapsed`/`onCollapsedChange`, `product` (`'cinema-studio' | 'marketing-studio' | 'supercomputer'`), `flush`. `Item`: slots `start`/`title`/`meta`/`end`, `size` (`'md' | 'sm'`), `variant` (`'nav' | 'project'`), `selected`, `pinned`/`onPinChange`, `action`, `href`. `Search`: `placeholder` (default `'Search'`), `icon`. Collapse self-wires via `Toggle`.
+
+### Forms and controls
+
+**`Input`** — `@higgsfield/quanta/input`
+`label` (ReactNode); `description` (ReactNode — helper text, hidden while error shows); `error` (ReactNode — presence triggers invalid state); `invalid` (bool — force invalid); `required` (bool; appends red `*`); `start`/`end` (leading/trailing slots; deprecated aliases `prefix`/`suffix`); `controlClassName`/`inputClassName`; + native `input` props (minus `size`/`prefix`/`color`). **Note: helper/error text props are `description`/`error`, NOT `helperText`/`errorText`.** Built on Base UI `Field`.
+
+**`Textarea`** — `@higgsfield/quanta/textarea`
+Same field shape as `Input`: `label`, `description`, `error`, `invalid`, `required`, `start` (top-pinned), `end` (bottom-pinned); `rows`; + native `textarea` props. Built on Base UI `Field`.
+
+**`Select`** — `@higgsfield/quanta/select` · Parts: `Root`/`Trigger`/`Value`/`Icon`/`Content`/`Group`/`GroupLabel`/`Separator`/`Item`/`ItemText`/`ItemIndicator`
+`Root`: `connected` (bool — popup as seamless extension), + `value`/`defaultValue`/`onValueChange`/`multiple`. `Trigger`: `size` (`'sm' | 'md' | 'lg'`; default `'md'`), `invalid`. `Value`: `placeholder`. `Content`: `surface` (`'glass' | 'solid'`), `side`/`align`/`sideOffset`. `Item`: `value`, `disabled`.
+
+**`Autocomplete`** — `@higgsfield/quanta/autocomplete` · Parts: `Root`/`Input`/`Content`/`List`/`Item`/`Group`/`Empty`/`Clear`… (type-to-filter)
+`Root`: `connected`, + `value`/`defaultValue`/`onValueChange`/`items`/`filter`. `Input`: `start` (default search icon; `null` removes), `clear` (bool; default `true`), `clearLabel`. `Content`: `solid` (bool). `Item`: `value`, `disabled`.
+
+**`Checkbox`, `CheckboxLabel`** — `@higgsfield/quanta/checkbox`
+`Checkbox`: `color` (`'brand' | 'white'`; default `'brand'`), `size` (`'sm' | 'md' | 'lg'`; default `'md'`), `indeterminate`, + `checked`/`defaultChecked`/`onCheckedChange`/`disabled`. `CheckboxLabel`: `label`, `description`, `direction` (`'left' | 'right'`; default `'left'`), `size` (`'sm' | 'md'`), `checkboxProps`.
+
+**`Radio`, `RadioGroup`, `RadioLabel`** — `@higgsfield/quanta/radio`
+`Radio`: `color` (`SlotColor`; default `'brand'`), `size` (`'sm' | 'md' | 'lg'`), + `value`/`disabled`. `RadioGroup`: `value`/`defaultValue`/`onValueChange`. `RadioLabel`: `value` (required), `label`, `description`, `direction`, `size` (`'sm' | 'md'`), `radioProps`. No indeterminate state.
+
+**`Switch`, `SwitchLabel`** — `@higgsfield/quanta/switch`
+`Switch`: `color` (`SlotColor`; default `'brand'`), `size` (`'small' | 'medium' | 'default'`; default `'small'`), + `checked`/`defaultChecked`/`onCheckedChange`/`disabled`. `SwitchLabel`: `label`, `description`, `direction`, `size` (`'sm' | 'md'`), `switchProps`.
+
+**`Slider`** — `@higgsfield/quanta/slider`
+Common: `disabled`, `showTicks`, `onChange` (`(n) => void` continuous), `onChangeEnd` (on release), `value`/`defaultValue`, `aria-label`. Stepped mode (default): `mode?: 'stepped'`, `steps` (number; min 2, default 3), value is 0-indexed step. Continuous: `mode: 'continuous'` (required), `min` (default `0`), `max` (default `1`), `step` (default `0` = free), `steps` (tick marks).
+
+**`Toggle`** — `@higgsfield/quanta/toggle`
+`color` (`SlotColor`; default `'brand'`), `size` (`'sm' | 'md' | 'lg'`), `start`/`end` slots, `children` (label), + `pressed`/`defaultPressed`/`onPressedChange`.
+
+**`Chip`** — `@higgsfield/quanta/chip`
+`color` (`SlotColor`; default `'brand'`), `size` (`'xxs' | 'xs' | 'sm' | 'md'`; default `'sm'`), `selected` (bool), `start`/`end` slots, `children` (label). Renders `<button type="button" aria-pressed={selected}>`.
+
+### Overlays and feedback
+
+**`Modal`** — `@higgsfield/quanta/modal` · Parts: `Root`/`Trigger`/`Close`/`Content`/`Header`/`Title`/`Description`/`CloseButton`/`BackButton`/`Search`/`Body`/`Workspace`/`Footer`/`FooterActions`
+`Content`: `size` (`'xs' | 'sm' | 'md' | 'lg' | 'xl' | '2xl'`; default `'md'`), `initialFocus`, `container`. `Header`: `flush`. `Body`/`Workspace`: `padded` (default `true`). `Footer`/`FooterActions`: `full`. `Search`: `placeholder`, `icon`. Use `Modal.Workspace` for the inset frosted pane.
+
+**`Vault`** — `@higgsfield/quanta/vault` · Parts: `Root`/`Trigger`/`Content`/`Header`/`Body`/`Footer`/`Title`/`Close`
+`Root`: `side` (`'bottom' | 'top' | 'left' | 'right'`; default `'bottom'`). `Content`: `side` (override), `handle` (bool; default `true` for bottom). `Header`: `title`, `start`/`end`, `closeButton`. `Footer`: `caption`, `actions`, `full`.
+
+**`Toaster`, `toast`** — `@higgsfield/quanta/sonner`
+`Toaster`: `position` (`'top-left' | 'top-center' | 'top-right' | 'bottom-left' | 'bottom-center' | 'bottom-right'`; default `'bottom-right'`), `limit` (default `3`), `duration` (ms; default `5000`), `expand`. Mount one near app root. API: `toast(title, options?)`, `toast.success/error/warning/info/loading/message(...)`, `toast.dismiss(id?)`, `toast.promise(p, { loading, success, error })`. `ToastOptions`: `description`, `duration` (`0` = sticky), `icon`, `action` (`{ label, onClick }`), `id`.
+
+**`Progress`** — `@higgsfield/quanta/progress`
+`value` (omit for indeterminate), `max` (default `100`), `variant` (`'bar' | 'dots' | 'line'`; default `'bar'`), `shape` (`'linear' | 'circular'`; default `'linear'`), `steps` (default `4`), `size` (`'xxs' | 'xs' | 'sm' | 'md' | 'lg'`), `color` (`SlotColor`), `animated`, `children` (center label for circular).
+
+**`Loader`** — `@higgsfield/quanta/loader`
+`variant` (`'dots' | 'circle' | 'stars' | 'shine'`; default `'circle'`), `size` (`'xxs' | 'xs' | 'sm' | 'md' | 'lg'`), `color` (`SlotColor`), `animated`, `aria-label` (default `'Loading'`).
+
+**`Tooltip`** — `@higgsfield/quanta/tooltip` · Parts: `Provider`/`Root`/`Trigger`/`Content`
+`Root`: `delay` (ms; default `600`), `closeDelay`, `hoverable`. `Content`: `side` (default `'top'`), `align` (default `'center'`), `sideOffset` (default `6`), `arrow` (bool). Share a `Provider` for common delay.
+
+**`CloseButton`** — `@higgsfield/quanta/close-button`
+`size` (`'sm' | 'md' | 'lg' | 'xl'`; default `'md'`), `children` (override cross glyph), `aria-label` (default `'Close'`).
+
+### Display primitives
+
+**`Avatar`** — `@higgsfield/quanta/avatar`
+`size` (`'xxs' | 'xs' | 'sm' | 'md' | 'lg' | 'xl'`; default `'md'`), `src`, `alt` (drives initials + auto color), `fallback`, `color` (`'neutral' | 'orange' | 'mint' | 'blue' | 'pink' | 'purple' | 'brown' | 'yellow'`; auto-hashed from `alt`), `status` (`'online' | 'offline' | 'away' | 'busy'`), `badge`, `variant` (`'filled' | 'pending' | 'dashed'`).
+
+**`Badge`** — `@higgsfield/quanta/badge`
+`variant` (`'blue' | 'lime' | 'pink' | 'purple' | 'limeSubtle' | 'nBrand' | 'nBlue'`; default `'blue'`), `size` (`'xs' | 'sm'`; default `'xs'`), `text` (falls back to `children`).
+
+**`Tag`** — `@higgsfield/quanta/tag`
+`color` (`SlotColor`; default `'neutral'`), `start`/`end` slots, `onRemove` (`() => void` — renders trailing ✕), `removeLabel`. Label is `children`.
+
+**`Dot`** — `@higgsfield/quanta/dot`
+`color` (`'green' | 'yellow' | 'red' | 'grey'`; default `'green'`), `size` (`'md' | 'sm' | 'xs'`), `animation` (`'pulse' | 'glow'`), `label` (sets `role="img"`).
+
+**`Kbd`, `KbdSequence`** — `@higgsfield/quanta/kbd`
+`Kbd`: native `kbd` props (single size). `KbdSequence`: `keys` (`ReactNode[]` — strings wrap in `<Kbd>`), `separator` (default `'+'`; `null` omits).
+
+**`Divider`** — `@higgsfield/quanta/divider`
+`orientation` (`'horizontal' | 'vertical'`; default `'horizontal'`), `children` (optional inline label, horizontal only).
+
+**`NotFound`** — `@higgsfield/quanta/not-found`
+`icon`, `title`, `subtitle`, `actions`, `size` (`'sm' | 'md' | 'lg'`), `variant` (`'plain' | 'card' | 'outline'`; default `'plain'`). Use for empty states.
+
+**`Accordion`** — `@higgsfield/quanta/accordion` · Parts: `Root`/`Item`/`Trigger`/`Panel`
+`Root`: `variant` (`'list' | 'separated'`; default `'list'`), `size` (`'sm' | 'md' | 'lg'`), + `value`/`openMultiple`. `Trigger`: `start`/`end` slots (default rotating chevron), label is `children`. `Panel`: `contentClassName`.
+
+**`Icon`** — `@higgsfield/quanta/icon`
+`size` (`'xs' | 'sm' | 'md' | 'lg' | 'xl'` → 12/16/20/24/28px; default `'md'`), `color` (`'primary' | 'secondary' | 'tertiary' | 'brand' | 'accent' | 'inverse' | 'disabled' | 'error' | 'success' | 'warning' | 'info'`; omit to inherit `currentColor`), `as` (glyph component, takes precedence over `children`), `label` (sets `role="img"`). App icons import lucide by name: `import { Search } from 'lucide-react'` (typed exports).
+
+**`Typography`** — `@higgsfield/quanta/typography`
+`as` (ElementType; default `'p'`), `variant` (`TypographyVariant`; default `'body-md-regular'` — `{display|headline|title|body|label|caption|mono|accent}-{lg|md|sm}-{weight}`), `color` (same set as Icon + `link`/`brand`/`danger`/…), `truncate`. Component form of `text-q-*` utilities.
+
+### Layout and surfaces
+
+**`Grid`, `VirtualGrid`** — `@higgsfield/quanta/grid` · `Grid.Item` for cells
+`Grid`: `cols` (`number | 'auto-fit' | 'auto-fill'`; default `1`), `minColWidth` (CSS length STRING for auto-fit/fill, e.g. `"13rem"` — never a number), `gap`/`gapX`/`gapY` (`1..24` scale), `flow` (`'row' | 'col' | 'dense'`), `align`/`justify`, `animate` (FLIP). `Grid.Item`: `colSpan`/`rowSpan`/`colStart` (`1..12`), `flipKey`. `VirtualGrid<Item>`: `items` (required), `renderItem` (required), `rowHeight` (px, required), `cols` or `minColWidth` (here a NUMBER of px, e.g. `180` — unlike `Grid.minColWidth` which is a CSS string), `gap`, `overscan` (default `3`), `getKey`, `height` (default `'32rem'`), `onEndReached` (once per item count near the viewport end), `endReachedThresholdPx` (default `400`). Pair with `Media.Video autoPlayInView`.
+
+**`Media`** — `@higgsfield/quanta/media` · Parts: `Root`/`Image`/`Video`/`Fallback`/`Overlay`/`Caption`
+`Root`: `ratio` (`'square' | 'video' | 'portrait' | 'wide' | 'auto'` or a number; default `'video'`), `rounded` (`'none' | 'sm' | 'md' | 'lg' | 'full'`; default `'md'`). `Image`: `fit` (`'cover' | 'contain'`; default `'cover'`), `alt`. `Video`: `fit`, `autoPlayInView` (bool — muted autoplay only while on screen), `inViewThreshold` (default `0.5`). `Overlay`: `placement` (`'fill' | 'top' | 'bottom' | 'center'`). Hook `useMediaFallback()` → `{ failed, onError, reset }`.
+
+**`Glass`** — `@higgsfield/quanta/glass`
+`blur` (`'sm' | 'md' | 'lg'`; default `'md'`), `elevation` (`'flat' | 'raised'`), `rounded` (`'200'…'600' | 'full'`; default `'600'`), `interactive` (bool), `tint` (`SlotColor`). Pin over colorful media.
+
+**`Card`** — `@higgsfield/quanta/card` · Parts: `Root`/`Header`/`Title`/`Description`/`Body`/`Footer`
+`Root`: `surface` (`'glass' | 'solid'`; default `'glass'`), `elevation` (`'flat' | 'raised'`). `Header`: `title`, `description`, `actions`. `Footer`: `actions`. Do not nest cards inside cards.
+
+## Component recipes
+
+### Modal
+
+```tsx
+<Modal.Root>
+  <Modal.Trigger render={<Button variant="secondary">Open</Button>} />
+  <Modal.Content size="lg">
+    <Modal.Header>
+      <Modal.Title>Edit settings</Modal.Title>
+      <Modal.CloseButton />
+    </Modal.Header>
+    <Modal.Body>
+      <Modal.Workspace>
+        <Input label="Name" />
+      </Modal.Workspace>
+    </Modal.Body>
+    <Modal.Footer>
+      <Modal.FooterActions>
+        <Button>Save</Button>
+      </Modal.FooterActions>
+    </Modal.Footer>
+  </Modal.Content>
+</Modal.Root>
 ```
 
-`profile.getCredits()` returns a `ProfileCredits` object, not a number. Never
-write `typeof credits === 'number'`; use one of the display fields above.
+`Modal.Header` and `Modal.Footer` are plain rows you COMPOSE — they have no
+`title`/`actions` prop. Put a `Modal.Title` (+ optional `Modal.CloseButton`) in
+the header and a `Modal.FooterActions` (optionally a `Modal.FooterCaption`) in
+the footer. `<Modal.Header title="…" />` is NOT a heading — `title` is just the
+native HTML tooltip attribute, so it type-checks but renders nothing visible.
+(Unlike `Vault.Footer`/`Card.Footer`, which do take an `actions` prop — the
+parts are not uniform.) Use `Modal.Workspace` for the inset frosted pane inside
+modal bodies. For split layouts, place multiple workspaces inside your own
+`flex` or `grid`.
 
-`switchWorkspace()` posts backend context and returns a fresh snapshot. Host
-apps still own Clerk/session metadata, React Query invalidation, and adapter
-header state.
+### Command palette
 
-## Observability recipes
-
-Observability is a vendor-neutral observer callback. The SDK does not send
-telemetry anywhere by itself.
-
-```ts
-import { createJobClient } from '@higgsfield/fnf/client'
-import { createConsoleObserver } from '@higgsfield/fnf/observability'
-
-const observer = createConsoleObserver()
-
-const client = createJobClient({
-  adapter,
-  jobs: [seedance2_0],
-  observability: {
-    observer,
-    traceId: requestId,
-    attributes: { surface: 'sandbox' },
-  },
-})
+```tsx
+<Command.Dialog shortcut="mod+k" label="Command menu">
+  <Command.Input placeholder="Search actions..." />
+  <Command.List>
+    <Command.Empty>No results.</Command.Empty>
+    <Command.Group heading="Actions">
+      <Command.Item
+        title="New project"
+        subtitle="Create a fresh workspace"
+        onSelect={createProject}
+      />
+    </Command.Group>
+  </Command.List>
+</Command.Dialog>
 ```
 
-Expected event names include:
+Use `Command.Body`, `Command.Detail`, `Command.Footer`, and `Command.Action`
+for two-pane palettes.
 
-- jobs: `fnf.job.submit`, `fnf.job.cost`, `fnf.job.get`, `fnf.job.get_set`,
-  `fnf.job.list`, `fnf.job.cancel`, `fnf.job.wait`, `fnf.job.poll`
-- media: `fnf.media.upload`, `fnf.media.presign`, `fnf.media.transfer`,
-  `fnf.media.confirm`, `fnf.media.get`, `fnf.media.list`, `fnf.media.resolve`
-- profile: `fnf.profile.get_user`, `fnf.profile.list_workspaces`,
-  `fnf.profile.get_current_workspace`, `fnf.profile.get_wallet`,
-  `fnf.profile.get_credits`, `fnf.profile.get_snapshot`,
-  `fnf.profile.switch_workspace`
-- transport/backend wrappers: `fnf.transport.request` and
-  `fnf.backend.*` wrapper spans
+### Vault drawer
 
-Observer errors are caught and never change SDK behavior. Async observer
-promises are intentionally not awaited.
-
-Privacy rule: never add prompts, request bodies, raw params, auth headers,
-tokens, upload/result URLs, filenames, emails, workspace names, or file bytes to
-event attributes. Bridge the safe observer events to Sentry, Datadog,
-OpenTelemetry, console logs, or product analytics in host code.
-
-## Current SDK catalog
-
-Import catalog entries from `@higgsfield/fnf/jobs` and register them with
-`createJobClient({ jobs: [...] })`.
-
-Image:
-
-- `soulV2Image` -> `text2image_soul_v2`
-- `soulCinemaImage` -> `soul_cinematic`
-- `gptImage2` -> `gpt_image_2`
-- `seedreamV4_5`
-- `nanoBanana2` -> `nano_banana_2`
-- `nanoBananaFlash` -> `nano_banana_flash`
-- `recraftV41Image`
-
-Video:
-
-- `seedance2_0` with `settings.mode: 'std' | 'fast'`
-- `seedance2_5` with `settings.model: 'default' | 'video_edit' |
-  'video_extension'` — one job set type, three shapes. `default`
-  generates from prompt + references; `video_edit` rewrites the ONE
-  attached `video` ref (its length and box come from that clip, so
-  `duration`/`aspectRatio` are ignored); `video_extension` continues a
-  clip and additionally requires `settings.extensionMode:
-  'backward' | 'forward'`. Takes up to 30 images, 10 videos and 10
-  audios (50 refs total, counting `<<<element>>>`/`@uuid` mentions in
-  the prompt); reference videos and audios are each 2-30s.
-- `kling3_0`
-- `kling3MotionControl`
-- `happyHorse`
-- `grokImagine`
-- `grokImagineV15`
-- `veo3_1Lite`
-- `wan27`
-
-Upscale:
-
-- `topazImageUpscale`
-- `topazImageGenerativeUpscale`
-- `nanoBanana2Upscale`
-- `topazVideoUpscale`
-- `higgsfieldVideoUpscale`
-- `soraEnhanceVideo`
-- `bytedanceVideoUpscale`
-
-Legacy/currently supported baseline:
-
-- `klingVideo`
-- `textToImageSoul`
-
-## Errors and boundaries
-
-All SDK errors extend `ApiJobError` with stable `code`, optional `status`, and
-typed `data`. `toJSON()` is uniform; `errorFromJSON` restores SDK error classes
-when needed.
-
-Common codes: `validation`, `out_of_credits`, `rate_limit`,
-`minimum_plan_required`, `prompt_nsfw`, `ip_detected`,
-`ip_check_rate_limit_reached`, `job_failed`, `timeout`, `aborted`,
-`not_supported`, `media_too_large`, `request_timeout`,
-`confirmation_rejected` (the host's `confirm` gate declined the submission —
-a user choice, not a failure).
-
-For UI and worker/iframe boundaries, branch on `error.code`:
-
-```ts
-const result = await client.safeSubmit(input)
-
-if (!result.ok) {
-  if (result.error.code === 'out_of_credits') {
-    // show billing/credits UI
-  }
-}
+```tsx
+<Vault.Root side="bottom">
+  <Vault.Trigger render={<Button variant="secondary">Filters</Button>} />
+  <Vault.Content>
+    <Vault.Header title="Filters" />
+    <Vault.Body>...</Vault.Body>
+    <Vault.Footer actions={<Button>Apply</Button>} />
+  </Vault.Content>
+</Vault.Root>
 ```
 
-Avoid:
+Use `Vault` for drawers/sheets. Use `Modal` for centered dialogs.
 
-```ts
-try {
-  await client.submit(input)
-}
-catch (error) {
-  if (error instanceof OutOfCreditsError) {
-    // fragile across postMessage/Comlink/JSON boundaries
-  }
-}
+## Premium layout rules for generated apps
+
+1. **Start with the real app surface, not a marketing page** — if the prompt
+   asks for a tool, editor, dashboard, feed, generator, or workspace, that tool
+   is the first viewport.
+2. **Use a stable shell:** `min-h-dvh`, optional sidebar, main work area,
+   constrained scroll regions. No app header/top bar — Higgsfield chrome
+   provides the global header; a page title is a heading inside the work area.
+3. **Give layouts breathing room:** `p-4`–`p-8`, `gap-3`–`gap-6`, visible
+   hierarchy — text hugging borders looks unfinished.
+4. **Use professional type scale:** page titles `text-q-title-lg-semi-bold` or
+   `text-q-headline-md-semi-bold`, body `text-q-body-md-regular`, metadata
+   `text-q-caption-sm-medium`. Do not make every label the same size.
+5. **Choose the correct control:** icons for icon-only actions, `Button` for
+   commands, `Tabs` for modes, `Dropdown` for option sets, `Switch`/`Checkbox`
+   for booleans, `Slider` for ranges, `Input` for typed values.
+6. **Do not nest cards inside cards** — use full-width bands, shells, sidebars,
+   workspaces, or repeated item cards.
+7. **Make empty/loading/error states first-class:** `Progress`, `Tag`, `Badge`,
+   `NotFound`, and clear local state surfaces rather than blank panels.
+8. **Keep text inside containers:** `min-w-0`, `truncate`, responsive grids,
+   fixed control dimensions where needed.
+9. **Dark surfaces need contrast:** pair `bg-q-background-primary` with nested
+   `bg-q-background-secondary` or component surfaces, plus subtle borders.
+10. **No arbitrary brand decoration:** no gradient orbs, blur blobs, raw
+    purple/blue gradients, or stock illustration unless the prompt calls
+    for it.
+
+## Component override tokens
+
+A generated tier of GLOBAL component-dimension knobs is published on `:root` in
+`src/css/components/component.css`. These are the single-value sizing defaults
+a consumer would set to resize a component — NOT per-variant color/state logic,
+which stays inline in each component's CSS.
+
+| Token | Default | Resizes |
+|---|---|---|
+| `--q-modal-width` | `40rem` | Modal popup width |
+| `--q-modal-width-{xs,sm,md,lg,xl,2xl}` | `21.8125rem`…`87rem` | Modal `size` variant widths |
+| `--q-menu-min-width` | `160px` | Dropdown/menu min width |
+| `--q-menu-max-width` | `400px` | Dropdown/menu max width |
+| `--q-sidebar-width` | `14.9375rem` | Sidebar rail width |
+| `--q-sidebar-width-collapsed` | `3.25rem` | Collapsed sidebar rail width |
+| `--q-nav-col-width` | `192px` | NavigationMenu legacy column width |
+| `--q-slider-width` | `11.5rem` | Slider track width |
+| `--q-sonner-width` | `22.5rem` | Toast viewport width |
+| `--q-vault-width` | `22rem` | Vault drawer width |
+| `--q-textarea-min-height` | `10.25rem` | Textarea min height |
+
+To resize component X, set its `--q-<comp>-<dim>` on an ancestor (or the
+component instance) — the closer scope wins the cascade, and that override IS
+the mechanism. Example:
+
+```tsx
+// Wider modal for one screen — no prop, no custom CSS, just override the knob.
+<div style={{ '--q-modal-width': '52rem' }}>
+  <Modal.Root>…</Modal.Root>
+</div>
 ```
-
-## Anti-patterns
-
-### Do not fetch product job routes directly
-
-```ts
-await fetch(`${baseUrl}/jobs/v2/seedance_2_0`, { body: JSON.stringify(params) }) // bad
-await client.submit({ model: 'seedance_2_0', prompt, settings })                 // good
-```
-
-Direct fetches bypass validation, route/body special cases, typed errors,
-cost logic, restore/finalize round-trips, and observability.
-
-Generated apps must use `createWorkflowPlatformAdapter` against
-`https://fnf.internal` rather than direct fnf product routes. The adapter may
-call only `/user`, `/workspaces/*`, and `/jobs/*`; do not add `/jobs/v2/*`,
-`/job-sets/*`, `/media/*`, `/video`, `/audio`, or `/workspaces/details` paths to
-generated app code.
-
-### Do not use backend snake_case in public settings
-
-```ts
-settings: { aspect_ratio: '9:16', batch_size: 2 } // bad; stripped by schema
-settings: { aspectRatio: '9:16', batchSize: 2 }   // good
-extra: { experimental_backend_flag: true }        // good only when deliberate
-```
-
-### Do not display raw wallet balances
-
-```ts
-wallet.subscriptionBalance                  // bad for UI; raw credit-cents
-snapshot.credits?.monthlyRemaining          // good display credits
-snapshot.credits?.raw.monthlyRemaining      // good only for debug/accounting
-await client.cost(seedanceInput)            // good model preview; 2250 cents -> 23 credits
-```
-
-### Do not leak private payloads into observability
-
-```ts
-attributes: { prompt: input.prompt.instruction } // bad
-attributes: { model: input.model }               // good
-```
-
-### Do not assume all adapters support all optional calls
-
-Generic tools should handle `error.code === 'not_supported'` for operations
-such as unsupported list filters, unavailable media listing, missing cancel
-support, or backend-only costs.
-
-## Extending the SDK catalog
-
-Use `defineJob({ jobSetType, outputType, params, validate, credits, finalize,
-restore })`. The public settings schema should be camelCase; wire names belong
-in `z.wire`.
-
-Non-negotiables:
-
-1. Ground product constants in fnf-web and fnf-api behavior; cite provenance in
-   comments where existing jobs do.
-2. Reuse helpers in `jobs/checks.ts`, `jobs/dimensions.ts`,
-   `jobs/video-helpers.ts`, `jobs/image-helpers.ts`, and
-   `jobs/upscale-helpers.ts` before adding one-off logic.
-3. If `finalize` deletes, renames, or derives settings, add `restore` so
-   get-then-resubmit round-trips parsed generations correctly.
-4. Export new jobs from `src/jobs/index.ts` and the root barrel.
-5. Update `createFnfWebAdapter` route/body/cost behavior (in
-   `@higgsfield/fnf-adapters`) when the product route is not the generic
-   `/jobs/{jobSetType}` shape.
-6. Add tests for defaults, validations, media role/count/meta rules, cost,
-   adapter route/body shape, parse/build round-trips, and typed API coverage.
-7. For docs/type tests, use `expectType<T>(value)` instead of bare property
-   access expressions; ESLint treats bare expressions as unused.
-
-Focused package checks:
-
-```sh
-yarn workspace @higgsfield/fnf test
-yarn workspace @higgsfield/fnf typecheck
-yarn workspace @higgsfield/fnf-adapters test
-yarn workspace @higgsfield/fnf-adapters typecheck
-```
-
-The client/media/profile wire-parity tests (exact adapter routes and bodies)
-live in `packages/fnf-adapters/src/__tests__`; `@higgsfield/fnf` keeps the
-port-level unit tests only.
-
-Do not run the full app build, `next build`, or `ci:build` in this workspace.
 
 ## When in doubt
 
-1. Read the job declaration in `src/jobs/<model>.ts`.
-2. Read `README.md` for the deeper SDK lifecycle and adapter model.
-3. Read the nearest product-parity test in `src/jobs/__tests__/`.
-4. Check `src/errors.ts` before branching on an error.
-5. Do not guess backend wire behavior; confirm it in product/backend source and
-   encode it through the SDK surface.
+Check the component `index.ts` exports and `src/css/tailwind/*.css` utility
+names; ask for a token gap instead of inventing values.
