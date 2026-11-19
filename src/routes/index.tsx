@@ -4,7 +4,7 @@ import { ArrowDown, ArrowUpLeft, Camera, Sparkles } from "lucide-react";
 import { scrollScrubScenes, scrollScrubTheme } from "@/scroll-scrub-scenes";
 import { ScrollScrub } from "@/components/scroll-scrub/scroll-scrub";
 const logo="https://d2ol7oe51mr4n9.cloudfront.net/user_3Lt2vVZzYV0HAWYOR3qyj1x8s33/1510a3b0-f064-4d17-bdf1-484297bf9db6.png";
-const instagram="https://www.instagram.com/isaac.travel/";
+const instagram="https://www.instagram.com/isaactravel120/";
 const tiktok="https://www.tiktok.com/@isaac.travel2";
 const homeSchema = JSON.stringify({
   "@context": "https://schema.org",
