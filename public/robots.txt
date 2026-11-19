@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://isaac-travel-production.up.railway.app/sitemap.xml
