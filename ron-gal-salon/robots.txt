@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://ron-gal-hair-salon-production.up.railway.app/sitemap.xml
