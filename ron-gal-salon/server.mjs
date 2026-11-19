@@ -3,12 +3,11 @@ import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL(".", import.meta.url));
-const types = {".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".webp":"image/webp",".xml":"application/xml; charset=utf-8",".txt":"text/plain; charset=utf-8"};
+const types = {".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".webp":"image/webp",".jpg":"image/jpeg",".jpeg":"image/jpeg",".xml":"application/xml; charset=utf-8",".txt":"text/plain; charset=utf-8"};
 createServer(async (req,res)=>{
  try {
   const pathname=decodeURIComponent(new URL(req.url||"/","http://localhost").pathname);
-  if(pathname==="/ron-front.webp"){res.writeHead(302,{Location:"https://drive.google.com/uc?export=download&id=19d9VJ2zNyWI6wp34g6ZF3DMylDL3DFF7","Cache-Control":"public, max-age=86400"});res.end();return;}
-  const safe=normalize(pathname).replace(/^([.][.][/\\])+/, "").replace(/^[/\\]+/, "");
+  const safe=normalize(pathname).replace(/^([.][.][/\\\\])+/, "").replace(/^[/\\\\]+/, "");
   let file=join(root,safe||"index.html");
   if(!file.startsWith(root)) throw new Error("Invalid path");
   try{if((await stat(file)).isDirectory())file=join(file,"index.html");}catch{if(!extname(file))file=join(root,"index.html");}
