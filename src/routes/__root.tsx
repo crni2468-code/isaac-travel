@@ -4,6 +4,7 @@ import {
   Link,
   createRootRouteWithContext,
   useRouter,
+  useNavigate,
   HeadContent,
   Scripts,
 } from "@tanstack/react-router";
@@ -108,20 +109,11 @@ function buildHead(meta: AppMeta) {
 }
 
 function NotFoundComponent() {
-  return (
-    <div className="flex min-h-dvh items-center justify-center bg-q-background-primary px-4">
-      <NotFound
-        className="mx-auto max-w-md"
-        icon={<span className="text-q-title-md-semi-bold text-q-text-primary">404</span>}
-        title="Page not found"
-        subtitle="The page you're looking for doesn't exist or has been moved."
-      >
-        <Link to="/" className={button({ variant: "primary", size: "md" }, "mt-3")}>
-          Go home
-        </Link>
-      </NotFound>
-    </div>
-  );
+  const navigate = useNavigate();
+  useEffect(() => {
+    void navigate({ to: "/", replace: true });
+  }, [navigate]);
+  return null;
 }
 
 function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
